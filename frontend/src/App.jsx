@@ -1,9 +1,31 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 function App() {
   const [prompt, setPrompt] = useState('');
   const [generating, setGenerating] = useState(false);
   const [result, setResult] = useState(null);
+  const [apiAvailable, setApiAvailable] = useState(false);
+
+  // On mount, check backend health to determine whether hosted API is available
+  useEffect(() => {
+    let mounted = true;
+    const check = async () => {
+      try {
+        const res = await fetch('/api/health');
+        const j = await res.json();
+        if (mounted) setApiAvailable(Boolean(j.api_available));
+      } catch (e) {
+        if (mounted) setApiAvailable(false);
+      }
+    };
+    check();
+    // optionally poll health every 30s
+    const id = setInterval(check, 30000);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
+  }, []);
 
   const generateVideo = async () => {
     setGenerating(true);
@@ -38,7 +60,15 @@ function App() {
       minHeight: '100vh'
     }}>
       <h1>🎭 RealityBlur AI</h1>
-      <p>Backend Status: <span style={{color: '#00ff88'}}>✅ Connected</span></p>
+      <p>
+        Backend Status: <span style={{color: '#00ff88'}}>✅ Connected</span>
+        {' \u00A0'}
+        {apiAvailable ? (
+          <span style={{color: '#00ff88', fontWeight: 'bold'}}>🟢 AI Mode: Using Hugging Face API</span>
+        ) : (
+          <span style={{color: '#ff4444', fontWeight: 'bold'}}>🔴 Fallback Mode: Add HuggingFace Token for Real AI</span>
+        )}
+      </p>
       
       <div style={{ marginBottom: '20px' }}>
         <textarea
@@ -71,8 +101,12 @@ function App() {
           fontWeight: 'bold'
         }}
       >
-        {generating ? '⚡ Generating...' : '🎬 Generate Realistic Video'}
+        {generating ? '⏳ Generating AI Image...' : '🎬 Generate Realistic Image'}
       </button>
+
+      {generating && (
+        <div style={{ marginTop: '12px', color: '#00ff88' }}>⏳ Generating AI Image... this may take a moment</div>
+      )}
 
       {/* Results Display */}
       {result && (
@@ -84,6 +118,22 @@ function App() {
           borderRadius: '8px'
         }}>
           <h3>📊 Result:</h3>
+
+          {/* Source label and generation time */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+            {result.source === 'huggingface' ? (
+              <span style={{ color: '#00ff88', fontWeight: 'bold' }}>🟢 AI Generated</span>
+            ) : result.source === 'local' ? (
+              <span style={{ color: '#00aaff', fontWeight: 'bold' }}>🟣 Local Model</span>
+            ) : (
+              <span style={{ color: '#ff4444', fontWeight: 'bold' }}>🔴 Fallback Image</span>
+            )}
+
+            {typeof result.generation_time_ms !== 'undefined' && (
+              <span style={{ color: '#cfcfcf' }}>⏱️ {result.generation_time_ms} ms</span>
+            )}
+          </div>
+
           <pre style={{ 
             background: '#2a2a2a', 
             padding: '15px', 
