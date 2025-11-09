@@ -70,13 +70,26 @@ class RealityBlurEngine:
         }
 
         resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        # The legacy api-inference endpoint may return 410; in that case try
+        # the new router endpoint which expects a payload that includes the
+        # target model.
         if resp.status_code != 200:
-            # if HF returns JSON error, include it
-            try:
-                err = resp.json()
-            except Exception:
-                err = resp.text
-            raise RuntimeError(f'Hugging Face API error: {resp.status_code} {err}')
+            if resp.status_code == 410:
+                try:
+                    router_url = 'https://router.huggingface.co/hf-inference'
+                    alt_payload = { 'model': model_id, 'inputs': prompt, 'options': { 'wait_for_model': True } }
+                    resp2 = requests.post(router_url, headers=headers, json=alt_payload, timeout=120)
+                    resp = resp2
+                except Exception:
+                    pass
+
+            if resp.status_code != 200:
+                # if HF returns JSON error, include it
+                try:
+                    err = resp.json()
+                except Exception:
+                    err = resp.text
+                raise RuntimeError(f'Hugging Face API error: {resp.status_code} {err}')
 
         content_type = resp.headers.get('content-type', '')
         # If the response is an image (most models return image/png bytes), open it
