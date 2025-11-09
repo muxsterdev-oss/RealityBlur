@@ -11,6 +11,13 @@ from typing import Any, cast
 import json
 from pathlib import Path
 
+# Helper to read Hugging Face token from either HUGGINGFACE_TOKEN or HUGGINGFACE_TOKEN1
+def get_hf_token():
+    return os.getenv('HUGGINGFACE_TOKEN') or os.getenv('HUGGINGFACE_TOKEN1')
+import tempfile
+import subprocess
+import shutil
+
 app = Flask(__name__)
 CORS(app)
 
@@ -55,83 +62,132 @@ class RealityBlurEngine:
 
         Returns a PIL.Image on success or raises an Exception on failure.
         """
-        token = os.getenv('HUGGINGFACE_TOKEN')
+        token = get_hf_token()
         if not token:
             raise RuntimeError('HUGGINGFACE_TOKEN not set')
 
         model_id = 'runwayml/stable-diffusion-v1-5'
-        # Try to use the official huggingface_hub client (InferenceApi) which
-        # handles routing/endpoints; fall back to a raw HTTP request if the
-        # client isn't available.
+        # If a custom endpoint is provided via HF_INFERENCE_ENDPOINT, try it first.
+        hf_endpoint = os.getenv('HF_INFERENCE_ENDPOINT')
+        if hf_endpoint:
+            try:
+                headers = {'Authorization': f'Bearer {token}'} if token else {}
+                payload = {'inputs': prompt}
+                r = requests.post(hf_endpoint, headers=headers, json=payload, timeout=120)
+                if r.status_code == 200:
+                    ct = r.headers.get('content-type', '')
+                    if ct.startswith('image/'):
+                        return Image.open(io.BytesIO(r.content)).convert('RGB')
+                    try:
+                        j = r.json()
+                        if isinstance(j, dict) and 'data' in j and isinstance(j['data'], list) and len(j['data'])>0:
+                            b64 = j['data'][0]
+                            return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+                    except Exception:
+                        pass
+                # if not 200, capture and fall through to other attempts
+                # record as an early error in the diagnostics list
+                errors = [("HF_INFERENCE_ENDPOINT", f"status={getattr(r, 'status_code', None)}, text={getattr(r, 'text', '')[:300]}")]
+            except Exception as e:
+                errors = [("HF_INFERENCE_ENDPOINT_CALL", str(e))]
+
+        # We'll try several approaches in order and surface detailed errors
+        # so callers can see what failed. Methods tried:
+        # 1) huggingface_hub.InferenceClient.text_to_image (higher-level)
+        # 2) huggingface_hub.InferenceApi(...)(prompt, raw_response=True)
+        # 3) direct POST to router.huggingface.co/hf-inference
+
+        # preserve any early errors from custom endpoint attempt
+        if 'errors' not in locals():
+            errors = []
+
+        # Attempt 1: InferenceClient (modern high-level client)
         try:
-            from huggingface_hub import InferenceApi
-            api = InferenceApi(repo_id=model_id, token=token)
-            # The client returns bytes for image-producing models.
-            result = api(inputs=prompt, options={"wait_for_model": True})
-
-            # If result is bytes, open as image
-            if isinstance(result, (bytes, bytearray)):
-                return Image.open(io.BytesIO(result)).convert('RGB')
-
-            # If result is a dict/list, attempt to parse similar to previous logic
-            if isinstance(result, dict):
-                if 'error' in result:
-                    raise RuntimeError(f"Hugging Face API error: {result['error']}")
-                if 'data' in result and isinstance(result['data'], list) and len(result['data'])>0:
-                    b64 = result['data'][0]
+            from huggingface_hub import InferenceClient
+            client = InferenceClient(token=token)
+            try:
+                res = client.text_to_image(prompt, model=model_id)
+                if isinstance(res, (bytes, bytearray)):
+                    return Image.open(io.BytesIO(res)).convert('RGB')
+                # Some clients return dict/list metadata — try to parse possible image bytes
+                if isinstance(res, dict) and 'data' in res and isinstance(res['data'], list) and len(res['data'])>0:
+                    b64 = res['data'][0]
                     try:
                         return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
                     except Exception:
                         pass
-            if isinstance(result, list) and len(result)>0 and isinstance(result[0], (bytes, bytearray)):
-                return Image.open(io.BytesIO(result[0])).convert('RGB')
+            except Exception as e:
+                errors.append(('InferenceClient', str(e)))
+        except Exception as e:
+            errors.append(('InferenceClientImport', str(e)))
 
-        except Exception:
-            # If the client import or call fails, fall back to raw HTTP route
-            pass
-
-        # Fallback: raw HTTP call (legacy behavior). This will attempt the
-        # classical api-inference endpoint, and if it returns 410, try router.
-        url = f'https://api-inference.huggingface.co/models/{model_id}'
-        headers = { 'Authorization': f'Bearer {token}' }
-        payload = { 'inputs': prompt, 'options': { 'wait_for_model': True } }
-
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        if resp.status_code != 200:
-            if resp.status_code == 410:
-                try:
-                    router_url = 'https://router.huggingface.co/hf-inference'
-                    alt_payload = { 'model': model_id, 'inputs': prompt, 'options': { 'wait_for_model': True } }
-                    resp2 = requests.post(router_url, headers=headers, json=alt_payload, timeout=120)
-                    resp = resp2
-                except Exception:
-                    pass
-
-            if resp.status_code != 200:
-                try:
-                    err = resp.json()
-                except Exception:
-                    err = resp.text
-                raise RuntimeError(f'Hugging Face API error: {resp.status_code} {err}')
-
-        content_type = resp.headers.get('content-type', '')
-        if content_type.startswith('image/'):
-            return Image.open(io.BytesIO(resp.content)).convert('RGB')
-
+        # Attempt 2: InferenceApi with raw_response to inspect binary responses
         try:
-            data = resp.json()
-            if isinstance(data, dict) and 'error' in data:
-                raise RuntimeError(f"Hugging Face API error: {data['error']}")
-            if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list) and len(data['data'])>0:
-                b64 = data['data'][0]
+            from huggingface_hub import InferenceApi
+            api = InferenceApi(repo_id=model_id, token=token)
+            try:
+                resp = api(prompt, raw_response=True)
+                status = getattr(resp, 'status_code', None)
+                ct = resp.headers.get('content-type', '') if resp is not None else ''
+                if status == 200 and ct.startswith('image/'):
+                    return Image.open(io.BytesIO(resp.content)).convert('RGB')
+                # If JSON with base64 payload
                 try:
-                    return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+                    j = resp.json()
+                    if isinstance(j, dict) and 'data' in j and isinstance(j['data'], list) and len(j['data'])>0:
+                        b64 = j['data'][0]
+                        return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
                 except Exception:
                     pass
-        except Exception:
-            pass
+                errors.append(('InferenceApi', f'status={status}, content-type={ct}, text={resp.text[:300] if resp is not None else None}'))
+            except Exception as e:
+                errors.append(('InferenceApiCall', str(e)))
+        except Exception as e:
+            errors.append(('InferenceApiImport', str(e)))
 
-        raise RuntimeError('Unexpected response from Hugging Face Inference API')
+        # Attempt 3: direct router POST
+        try:
+            router_url = 'https://router.huggingface.co/hf-inference'
+            headers = {'Authorization': f'Bearer {token}'}
+            alt_payload = {'model': model_id, 'inputs': prompt, 'options': {'wait_for_model': True}}
+            r = requests.post(router_url, headers=headers, json=alt_payload, timeout=120)
+            if r.status_code == 200:
+                ct = r.headers.get('content-type', '')
+                if ct.startswith('image/'):
+                    return Image.open(io.BytesIO(r.content)).convert('RGB')
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and 'data' in j and isinstance(j['data'], list) and len(j['data'])>0:
+                        b64 = j['data'][0]
+                        return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+                except Exception:
+                    pass
+            errors.append(('router', f'status={r.status_code}, text={r.text[:300]}'))
+        except Exception as e:
+            errors.append(('routerCall', str(e)))
+
+        # As a last-ditch fallback, try the legacy api-inference endpoint (likely 410)
+        try:
+            url = f'https://api-inference.huggingface.co/models/{model_id}'
+            headers = { 'Authorization': f'Bearer {token}' }
+            payload = { 'inputs': prompt, 'options': { 'wait_for_model': True } }
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            ct = resp.headers.get('content-type', '')
+            if resp.status_code == 200 and ct.startswith('image/'):
+                return Image.open(io.BytesIO(resp.content)).convert('RGB')
+            try:
+                j = resp.json()
+                if isinstance(j, dict) and 'data' in j and isinstance(j['data'], list) and len(j['data'])>0:
+                    b64 = j['data'][0]
+                    return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+            except Exception:
+                pass
+            errors.append(('legacy_api', f'status={resp.status_code}, text={resp.text[:300]}'))
+        except Exception as e:
+            errors.append(('legacyCall', str(e)))
+
+        # All attempts failed — raise an error with collected diagnostics so callers can see why
+        raise RuntimeError('Hugging Face generation failed; attempts: ' + json.dumps(errors[:10], default=str))
 
     def generate_image(self, prompt):
         """Generate image from text prompt"""
@@ -181,7 +237,7 @@ def home():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     # Indicate whether a hosted API token is configured
-    api_available = bool(os.getenv('HUGGINGFACE_TOKEN'))
+    api_available = bool(get_hf_token())
     return jsonify({
         "status": "healthy",
         "device": engine.device,
@@ -199,14 +255,17 @@ def generate_video():
         print(f"🎬 Generating for prompt: {prompt}")
         start = time.time()
         source = 'fallback'
+        hf_diagnostics = None
         # If a Hugging Face token is provided, prefer the hosted API for real images
-        hf_token = os.getenv('HUGGINGFACE_TOKEN')
+        hf_token = get_hf_token()
         if hf_token:
             try:
                 image = engine.generate_with_hf(prompt)
                 source = 'huggingface'
             except Exception as e:
-                print(f"❌ Hugging Face API error: {e}")
+                # Capture diagnostics so the frontend can display why HF failed
+                hf_diagnostics = str(e)
+                print(f"❌ Hugging Face API error: {hf_diagnostics}")
                 # fallback to local engine (which may be placeholder)
                 image = engine.generate_image(prompt)
                 # if local pipeline exists, mark as local; otherwise keep fallback
@@ -226,6 +285,7 @@ def generate_video():
         return jsonify({
             "status": "success",
             "source": source,
+            "hf_diagnostics": hf_diagnostics,
             "generation_time_ms": duration_ms,
             "image": f"data:image/png;base64,{img_str}",
             "message": "🎭 Phase 1: Image generation working! Video coming next..."
@@ -266,6 +326,65 @@ def list_flows():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/api/render-video', methods=['POST'])
+def render_video():
+    try:
+        payload = request.json or {}
+        images = payload.get('images', [])
+        fps = int(payload.get('fps', 12))
+        codec = payload.get('codec', 'libx264')
+
+        if not images:
+            return jsonify({'status': 'error', 'message': 'no images provided'}), 400
+
+        # Ensure ffmpeg is available
+        if shutil.which('ffmpeg') is None:
+            return jsonify({'status': 'error', 'message': 'ffmpeg not found on server'}), 500
+
+        # Create temporary working directory
+        workdir = tempfile.mkdtemp(prefix='realityblur_video_')
+        try:
+            # Write frames as PNGs
+            for i, dataurl in enumerate(images):
+                # dataurl expected like 'data:image/png;base64,....'
+                if ',' in dataurl:
+                    _, b64 = dataurl.split(',', 1)
+                else:
+                    b64 = dataurl
+                data = base64.b64decode(b64)
+                fname = Path(workdir) / f'frame{i:04d}.png'
+                with open(fname, 'wb') as f:
+                    f.write(data)
+
+            out_path = Path(workdir) / 'out.mp4'
+            # Build ffmpeg command
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-framerate', str(fps),
+                '-i', str(Path(workdir) / 'frame%04d.png'),
+                '-c:v', codec,
+                '-pix_fmt', 'yuv420p',
+                str(out_path)
+            ]
+            subprocess.check_call(cmd)
+
+            # Read output and return as base64 data URL
+            with open(out_path, 'rb') as f:
+                vbytes = f.read()
+            v64 = base64.b64encode(vbytes).decode()
+            return jsonify({'status': 'success', 'video': f'data:video/mp4;base64,{v64}'})
+        finally:
+            try:
+                shutil.rmtree(workdir)
+            except Exception:
+                pass
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({'status': 'error', 'message': f'ffmpeg failed: {e}'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/api/flows/<flow_name>', methods=['GET'])
 def load_flow(flow_name):
     try:
@@ -283,4 +402,7 @@ engine = RealityBlurEngine()
 
 if __name__ == '__main__':
     print("🚀 Starting RealityBlur AI Server...")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Allow overriding the port via the PORT environment variable so we can
+    # avoid collisions during development (e.g., use PORT=5001).
+    port = int(os.getenv('PORT', '5000'))
+    app.run(debug=True, host='0.0.0.0', port=port)
