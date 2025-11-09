@@ -60,19 +60,43 @@ class RealityBlurEngine:
             raise RuntimeError('HUGGINGFACE_TOKEN not set')
 
         model_id = 'runwayml/stable-diffusion-v1-5'
+        # Try to use the official huggingface_hub client (InferenceApi) which
+        # handles routing/endpoints; fall back to a raw HTTP request if the
+        # client isn't available.
+        try:
+            from huggingface_hub import InferenceApi
+            api = InferenceApi(repo_id=model_id, token=token)
+            # The client returns bytes for image-producing models.
+            result = api(inputs=prompt, options={"wait_for_model": True})
+
+            # If result is bytes, open as image
+            if isinstance(result, (bytes, bytearray)):
+                return Image.open(io.BytesIO(result)).convert('RGB')
+
+            # If result is a dict/list, attempt to parse similar to previous logic
+            if isinstance(result, dict):
+                if 'error' in result:
+                    raise RuntimeError(f"Hugging Face API error: {result['error']}")
+                if 'data' in result and isinstance(result['data'], list) and len(result['data'])>0:
+                    b64 = result['data'][0]
+                    try:
+                        return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+                    except Exception:
+                        pass
+            if isinstance(result, list) and len(result)>0 and isinstance(result[0], (bytes, bytearray)):
+                return Image.open(io.BytesIO(result[0])).convert('RGB')
+
+        except Exception:
+            # If the client import or call fails, fall back to raw HTTP route
+            pass
+
+        # Fallback: raw HTTP call (legacy behavior). This will attempt the
+        # classical api-inference endpoint, and if it returns 410, try router.
         url = f'https://api-inference.huggingface.co/models/{model_id}'
-        headers = {
-            'Authorization': f'Bearer {token}'
-        }
-        payload = {
-            'inputs': prompt,
-            'options': { 'wait_for_model': True }
-        }
+        headers = { 'Authorization': f'Bearer {token}' }
+        payload = { 'inputs': prompt, 'options': { 'wait_for_model': True } }
 
         resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        # The legacy api-inference endpoint may return 410; in that case try
-        # the new router endpoint which expects a payload that includes the
-        # target model.
         if resp.status_code != 200:
             if resp.status_code == 410:
                 try:
@@ -84,7 +108,6 @@ class RealityBlurEngine:
                     pass
 
             if resp.status_code != 200:
-                # if HF returns JSON error, include it
                 try:
                     err = resp.json()
                 except Exception:
@@ -92,17 +115,13 @@ class RealityBlurEngine:
                 raise RuntimeError(f'Hugging Face API error: {resp.status_code} {err}')
 
         content_type = resp.headers.get('content-type', '')
-        # If the response is an image (most models return image/png bytes), open it
         if content_type.startswith('image/'):
             return Image.open(io.BytesIO(resp.content)).convert('RGB')
 
-        # Otherwise, try to decode JSON for an error or base64 image
         try:
             data = resp.json()
-            # Some endpoints may return {'data': ['<base64...>']}
             if isinstance(data, dict) and 'error' in data:
                 raise RuntimeError(f"Hugging Face API error: {data['error']}")
-            # If data contains base64 strings, attempt to decode the first
             if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list) and len(data['data'])>0:
                 b64 = data['data'][0]
                 try:
