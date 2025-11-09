@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import FlowEditor from './flow/FlowEditor'
 
 function App() {
   const [prompt, setPrompt] = useState('');
@@ -173,6 +174,15 @@ function App() {
           <li>Advanced realism enhancements</li>
           <li>Temporal consistency</li>
         </ul>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} style={{ marginRight: 8 }}>Back to Top</button>
+      </div>
+
+      <div style={{ marginTop: 30 }}>
+        <h2 style={{ marginBottom: 10 }}>🧩 Workflow Editor (Beta)</h2>
+        <FlowEditor />
       </div>
     </div>
   );
