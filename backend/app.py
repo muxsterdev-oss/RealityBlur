@@ -8,6 +8,8 @@ import os
 import requests
 import time
 from typing import Any, cast
+import json
+from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
@@ -200,6 +202,49 @@ def generate_video():
     except Exception as e:
         print(f"❌ Error in generation: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# Simple persistence for flows: save/load JSON files under backend/flows
+FLOWS_DIR = Path(__file__).parent / 'flows'
+FLOWS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.route('/api/flows', methods=['POST'])
+def save_flow():
+    try:
+        payload = request.json or {}
+        name = payload.get('name') or f'flow_{int(time.time())}'
+        nodes = payload.get('nodes', [])
+        edges = payload.get('edges', [])
+        fname = f"{int(time.time())}_{name}.json"
+        p = FLOWS_DIR / fname
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'name': name, 'nodes': nodes, 'edges': edges}, f, indent=2)
+        return jsonify({'status': 'ok', 'name': fname})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/flows', methods=['GET'])
+def list_flows():
+    try:
+        items = [p.name for p in sorted(FLOWS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True) if p.is_file()]
+        return jsonify(items)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/flows/<flow_name>', methods=['GET'])
+def load_flow(flow_name):
+    try:
+        p = FLOWS_DIR / flow_name
+        if not p.exists():
+            return jsonify({'status': 'error', 'message': 'not found'}), 404
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # Initialize the engine
 engine = RealityBlurEngine()
