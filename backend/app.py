@@ -385,6 +385,134 @@ def render_video():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+def generate_varied_images(prompt: str, num_variations: int = 4):
+    """Generate multiple varied images for the same prompt.
+    Returns list of PIL.Image objects.
+    """
+    images = []
+    hf_diagnostics = None
+    token = get_hf_token()
+    for i in range(num_variations):
+        varied_prompt = f"{prompt} - variation {i+1}"
+        try:
+            if token:
+                try:
+                    img = engine.generate_with_hf(varied_prompt)
+                except Exception as e:
+                    hf_diagnostics = (hf_diagnostics or []) + [str(e)]
+                    img = engine.generate_image(varied_prompt)
+            else:
+                img = engine.generate_image(varied_prompt)
+        except Exception as e:
+            # On unexpected error, produce a fallback image instead of failing entirely
+            print(f"❌ Error generating variation {i}: {e}")
+            img = Image.new('RGB', (512, 512), color=cast(Any, ImageColor.getrgb('#444444')))
+        images.append(img)
+    return images, hf_diagnostics
+
+
+@app.route('/api/generate-variations', methods=['POST'])
+def api_generate_variations():
+    try:
+        data = request.json or {}
+        prompt = data.get('prompt', 'A realistic scene')
+        num = int(data.get('num_variations', 4))
+        num = max(1, min(12, num))
+        imgs, hf_diag = generate_varied_images(prompt, num)
+
+        out = []
+        for img in imgs:
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            out.append('data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode())
+
+        return jsonify({'status': 'success', 'images': out, 'hf_diagnostics': hf_diag})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/render-dynamic-video', methods=['POST'])
+def render_dynamic_video():
+    """Render a dynamic video from multiple images applying short crossfade transitions.
+    Expects JSON { images: [dataurl,...], fps: int, duration: float }
+    """
+    try:
+        payload = request.json or {}
+        images = payload.get('images', [])
+        fps = int(payload.get('fps', 12))
+        duration = float(payload.get('duration', max(3, len(images))))
+        if not images:
+            return jsonify({'status': 'error', 'message': 'no images provided'}), 400
+
+        if shutil.which('ffmpeg') is None:
+            return jsonify({'status': 'error', 'message': 'ffmpeg not found on server'}), 500
+
+        workdir = tempfile.mkdtemp(prefix='realityblur_dyn_')
+        try:
+            # write inputs
+            for i, dataurl in enumerate(images):
+                if ',' in dataurl:
+                    _, b64 = dataurl.split(',', 1)
+                else:
+                    b64 = dataurl
+                data = base64.b64decode(b64)
+                fname = Path(workdir) / f'img{i:03d}.png'
+                with open(fname, 'wb') as f:
+                    f.write(data)
+
+            n = len(images)
+            trans = 0.8
+            seg = max(1.0, (duration / n)) + trans
+
+            # build ffmpeg inputs
+            cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+            for i in range(n):
+                cmd += ['-loop', '1', '-t', str(seg), '-i', str(Path(workdir) / f'img{i:03d}.png')]
+
+            # build filter_complex
+            filters = []
+            # initial stream label
+            # chain xfade between streams
+            # prepare labels: [0:v] [1:v] ...
+            last_label = '[0:v]'
+            for i in range(1, n):
+                offset = seg * i - trans
+                filt = f"{last_label}[{i}:v]xfade=transition=fade:duration={trans}:offset={offset}[v{i}]"
+                filters.append(filt)
+                last_label = f"[v{i}]"
+
+            filter_complex = ';'.join(filters)
+            if not filter_complex:
+                # Single image: just create a short looped video
+                in_file = str(Path(workdir) / 'img000.png')
+                out_path = Path(workdir) / 'out.mp4'
+                cmd_simple = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-loop', '1', '-i', in_file,
+                    '-c:v', 'libx264', '-t', str(duration), '-pix_fmt', 'yuv420p', str(out_path)
+                ]
+                subprocess.check_call(cmd_simple)
+            else:
+                out_path = Path(workdir) / 'out.mp4'
+                full_cmd = cmd + ['-filter_complex', filter_complex, '-map', last_label, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
+                subprocess.check_call(full_cmd)
+
+            with open(out_path, 'rb') as f:
+                vbytes = f.read()
+            v64 = base64.b64encode(vbytes).decode()
+            return jsonify({'status': 'success', 'video': f'data:video/mp4;base64,{v64}'})
+        finally:
+            try:
+                shutil.rmtree(workdir)
+            except Exception:
+                pass
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({'status': 'error', 'message': f'ffmpeg failed: {e}'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/api/flows/<flow_name>', methods=['GET'])
 def load_flow(flow_name):
     try:
