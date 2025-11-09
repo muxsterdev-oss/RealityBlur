@@ -2,10 +2,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import io
 import base64
-from PIL import Image
+from PIL import Image, ImageColor
 import torch
 import os
 import requests
+import time
+from typing import Any, cast
 
 app = Flask(__name__)
 CORS(app)
@@ -14,7 +16,11 @@ class RealityBlurEngine:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🚀 Using device: {self.device}")
-        self.pipe = None
+        # Annotate as Any so static type checkers don't try to validate
+        # call signatures or attributes on the diffusers pipeline object.
+        # Use a type comment to remain compatible with environments that
+        # don't accept inline variable annotations in this position.
+        self.pipe = None  # type: Any
         # Only load the heavy Stable Diffusion pipeline if a GPU is available.
         # Loading and running the full model on CPU in Codespaces or small machines
         # can cause native crashes or out-of-memory errors. We'll disable the
@@ -98,30 +104,37 @@ class RealityBlurEngine:
         if self.pipe is None:
             # Create a simple fallback image (placeholder) when pipeline isn't available
             from PIL import ImageDraw, ImageFont
-            img = Image.new('RGB', (512, 512), color='#0f0f0f')
+            # Use ImageColor.getrgb so type checkers don't complain about
+            # string color values; this produces an (R,G,B) tuple.
+            img = Image.new('RGB', (512, 512), color=cast(Any, ImageColor.getrgb('#0f0f0f')))
             draw = ImageDraw.Draw(img)
             try:
                 # Use a basic system font if available
                 font = ImageFont.load_default()
-                draw.text((16, 240), "Fallback image (model disabled)", fill="#00ff88", font=font)
+                draw.text((16, 240), "Fallback image (model disabled)", fill=cast(Any, ImageColor.getrgb('#00ff88')), font=font)
             except Exception:
                 pass
             return img
         
         try:
             with torch.no_grad():
-                result = self.pipe(
+                # Cast to Any to avoid static type-checker errors about
+                # DiffusionPipeline call signatures and result shapes.
+                pipe_any = cast(Any, self.pipe)
+                result = pipe_any(
                     prompt,
                     height=512,
                     width=512,
                     num_inference_steps=20,  # Faster generation
                     guidance_scale=7.5
                 )
+            # Access images dynamically; at runtime the pipeline result
+            # exposes an `images` attribute.
             return result.images[0]
         except Exception as e:
             print(f"❌ Generation error: {e}")
             # Fallback
-            return Image.new('RGB', (512, 512), color='#ff4444')
+            return Image.new('RGB', (512, 512), color=cast(Any, ImageColor.getrgb('#ff4444')))
 
 @app.route('/')
 def home():
@@ -145,22 +158,31 @@ def health_check():
 @app.route('/api/generate', methods=['POST'])
 def generate_video():
     try:
-        data = request.json
+        # request.json may be None if the client sent no JSON — guard against it.
+        data = request.json or {}
         prompt = data.get('prompt', 'A realistic scene')
         
         print(f"🎬 Generating for prompt: {prompt}")
+        start = time.time()
+        source = 'fallback'
         # If a Hugging Face token is provided, prefer the hosted API for real images
         hf_token = os.getenv('HUGGINGFACE_TOKEN')
         if hf_token:
             try:
                 image = engine.generate_with_hf(prompt)
+                source = 'huggingface'
             except Exception as e:
                 print(f"❌ Hugging Face API error: {e}")
                 # fallback to local engine (which may be placeholder)
                 image = engine.generate_image(prompt)
+                # if local pipeline exists, mark as local; otherwise keep fallback
+                source = 'fallback' if engine.pipe is None else 'local'
         else:
             # Generate image locally (fallback or real model if loaded)
             image = engine.generate_image(prompt)
+            source = 'fallback' if engine.pipe is None else 'local'
+
+        duration_ms = int((time.time() - start) * 1000)
         
         # Convert to base64 for frontend
         buffered = io.BytesIO()
@@ -169,6 +191,8 @@ def generate_video():
         
         return jsonify({
             "status": "success",
+            "source": source,
+            "generation_time_ms": duration_ms,
             "image": f"data:image/png;base64,{img_str}",
             "message": "🎭 Phase 1: Image generation working! Video coming next..."
         })
