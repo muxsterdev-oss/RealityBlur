@@ -1,0 +1,25 @@
+nohup: ignoring input
+
+> dev
+> vite
+
+
+  VITE v4.5.14  ready in 1408 ms
+
+  ➜  Local:   http://localhost:3000/
+  ➜  Network: http://10.0.0.42:3000/
+6:38:00 PM [vite] http proxy error at /api/generate-variations:
+Error: connect ECONNREFUSED 127.0.0.1:5000
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)
+6:38:13 PM [vite] http proxy error at /api/generate-variations:
+Error: connect ECONNREFUSED 127.0.0.1:5000
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)
+6:38:21 PM [vite] http proxy error at /api/generate-variations:
+Error: connect ECONNREFUSED 127.0.0.1:5000
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)
+6:38:42 PM [vite] http proxy error at /api/generate-variations:
+Error: connect ECONNREFUSED 127.0.0.1:5000
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)
+6:53:23 PM [vite] http proxy error at /api/generate-variations:
+Error: connect ECONNREFUSED 127.0.0.1:5000
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)

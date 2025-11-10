@@ -15,3 +15,6 @@ build/
 
 # Misc
 .DS_Store
+
+# Local backend logs
+backend/*.log
