@@ -18,6 +18,14 @@ import tempfile
 import subprocess
 import shutil
 
+# Preferred model priority list — try these in order until one succeeds
+MODEL_PRIORITY_LIST = [
+    'black-forest-labs/FLUX.1-schnell',
+    'runwayml/stable-diffusion-v1-5',
+    'stabilityai/stable-diffusion-2-1',
+    'CompVis/stable-diffusion-v1-4'
+]
+
 app = Flask(__name__)
 CORS(app)
 
@@ -57,7 +65,7 @@ class RealityBlurEngine:
             print(f"❌ Error loading model: {e}")
             self.pipe = None
 
-    def generate_with_hf(self, prompt: str):
+    def generate_with_hf(self, prompt: str, model_id: str = 'runwayml/stable-diffusion-v1-5'):
         """Generate an image using the Hugging Face Inference API.
 
         Returns a PIL.Image on success or raises an Exception on failure.
@@ -66,8 +74,8 @@ class RealityBlurEngine:
         if not token:
             raise RuntimeError('HUGGINGFACE_TOKEN not set')
 
-        model_id = 'runwayml/stable-diffusion-v1-5'
-        # If a custom endpoint is provided via HF_INFERENCE_ENDPOINT, try it first.
+    # model_id is provided by caller (default above)
+    # If a custom endpoint is provided via HF_INFERENCE_ENDPOINT, try it first.
         hf_endpoint = os.getenv('HF_INFERENCE_ENDPOINT')
         if hf_endpoint:
             try:
@@ -107,6 +115,13 @@ class RealityBlurEngine:
             client = InferenceClient(token=token)
             try:
                 res = client.text_to_image(prompt, model=model_id)
+                # Some clients may return a PIL Image object directly
+                try:
+                    from PIL import Image as PILImage
+                    if isinstance(res, PILImage.Image):
+                        return res.convert('RGB')
+                except Exception:
+                    pass
                 if isinstance(res, (bytes, bytearray)):
                     return Image.open(io.BytesIO(res)).convert('RGB')
                 # Some clients return dict/list metadata — try to parse possible image bytes
@@ -189,6 +204,28 @@ class RealityBlurEngine:
         # All attempts failed — raise an error with collected diagnostics so callers can see why
         raise RuntimeError('Hugging Face generation failed; attempts: ' + json.dumps(errors[:10], default=str))
 
+    def generate_with_smart_fallback(self, prompt: str):
+        """Try a prioritized list of models for hosted inference and return the first successful image and model id.
+
+        Returns (PIL.Image, model_id) on success or raises RuntimeError if none succeed.
+        """
+        token = get_hf_token()
+        if not token:
+            raise RuntimeError('HUGGINGFACE_TOKEN not set')
+
+        errors = []
+        for model in MODEL_PRIORITY_LIST:
+            try:
+                img = self.generate_with_hf(prompt, model_id=model)
+                return img, model
+            except Exception as e:
+                errors.append((model, str(e)))
+                # try next model
+                continue
+
+        # All models failed — raise with diagnostics
+        raise RuntimeError('All HF models failed; attempts: ' + json.dumps(errors[:10], default=str))
+
     def generate_image(self, prompt):
         """Generate image from text prompt"""
         if self.pipe is None:
@@ -256,11 +293,12 @@ def generate_video():
         start = time.time()
         source = 'fallback'
         hf_diagnostics = None
+        model_used = None
         # If a Hugging Face token is provided, prefer the hosted API for real images
         hf_token = get_hf_token()
         if hf_token:
             try:
-                image = engine.generate_with_hf(prompt)
+                image, model_used = engine.generate_with_smart_fallback(prompt)
                 source = 'huggingface'
             except Exception as e:
                 # Capture diagnostics so the frontend can display why HF failed
@@ -282,14 +320,17 @@ def generate_video():
         image.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
-        return jsonify({
+        resp = {
             "status": "success",
             "source": source,
             "hf_diagnostics": hf_diagnostics,
             "generation_time_ms": duration_ms,
             "image": f"data:image/png;base64,{img_str}",
             "message": "🎭 Phase 1: Image generation working! Video coming next..."
-        })
+        }
+        if model_used:
+            resp['model_used'] = model_used
+        return jsonify(resp)
         
     except Exception as e:
         print(f"❌ Error in generation: {e}")
@@ -390,16 +431,18 @@ def generate_varied_images(prompt: str, num_variations: int = 4):
     Returns list of PIL.Image objects.
     """
     images = []
-    hf_diagnostics = None
+    hf_diagnostics = []
+    models_used = []
     token = get_hf_token()
     for i in range(num_variations):
         varied_prompt = f"{prompt} - variation {i+1}"
         try:
             if token:
                 try:
-                    img = engine.generate_with_hf(varied_prompt)
+                    img, model = engine.generate_with_smart_fallback(varied_prompt)
+                    models_used.append(model)
                 except Exception as e:
-                    hf_diagnostics = (hf_diagnostics or []) + [str(e)]
+                    hf_diagnostics.append(str(e))
                     img = engine.generate_image(varied_prompt)
             else:
                 img = engine.generate_image(varied_prompt)
@@ -408,7 +451,7 @@ def generate_varied_images(prompt: str, num_variations: int = 4):
             print(f"❌ Error generating variation {i}: {e}")
             img = Image.new('RGB', (512, 512), color=cast(Any, ImageColor.getrgb('#444444')))
         images.append(img)
-    return images, hf_diagnostics
+    return images, (hf_diagnostics or None), models_used
 
 
 @app.route('/api/generate-variations', methods=['POST'])
@@ -418,7 +461,7 @@ def api_generate_variations():
         prompt = data.get('prompt', 'A realistic scene')
         num = int(data.get('num_variations', 4))
         num = max(1, min(12, num))
-        imgs, hf_diag = generate_varied_images(prompt, num)
+        imgs, hf_diag, models_used = generate_varied_images(prompt, num)
 
         out = []
         for img in imgs:
@@ -426,7 +469,7 @@ def api_generate_variations():
             img.save(buf, format='PNG')
             out.append('data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode())
 
-        return jsonify({'status': 'success', 'images': out, 'hf_diagnostics': hf_diag})
+        return jsonify({'status': 'success', 'images': out, 'hf_diagnostics': hf_diag, 'models_used': models_used})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -441,6 +484,27 @@ def render_dynamic_video():
         images = payload.get('images', [])
         fps = int(payload.get('fps', 12))
         duration = float(payload.get('duration', max(3, len(images))))
+        effects = payload.get('effects', []) or []
+        transitions = payload.get('transitions', []) or []
+        preset = (payload.get('preset') or payload.get('profile'))
+        motion_blur = bool(payload.get('motion_blur', False))
+        film_grain = float(payload.get('film_grain', 0.0) or 0.0)
+        color_grade = payload.get('color_grade', None)
+        sharpening = float(payload.get('sharpening', 0.0) or 0.0)
+        aspect = payload.get('aspect_ratio') or payload.get('aspect') or payload.get('aspectRatio')
+
+        # Apply presets
+        PRESETS = {
+            "tiktok": {"fps": 30, "duration": 15, "aspect": "9:16"},
+            "instagram": {"fps": 30, "duration": 30, "aspect": "1:1"},
+            "youtube": {"fps": 30, "duration": 60, "aspect": "16:9"}
+        }
+        if preset and preset in PRESETS:
+            p = PRESETS[preset]
+            fps = int(p.get('fps', fps))
+            duration = float(p.get('duration', duration))
+            aspect = aspect or p.get('aspect')
+
         if not images:
             return jsonify({'status': 'error', 'message': 'no images provided'}), 400
 
@@ -450,6 +514,7 @@ def render_dynamic_video():
         workdir = tempfile.mkdtemp(prefix='realityblur_dyn_')
         try:
             # write inputs
+            in_files = []
             for i, dataurl in enumerate(images):
                 if ',' in dataurl:
                     _, b64 = dataurl.split(',', 1)
@@ -459,45 +524,145 @@ def render_dynamic_video():
                 fname = Path(workdir) / f'img{i:03d}.png'
                 with open(fname, 'wb') as f:
                     f.write(data)
+                in_files.append(str(fname))
 
-            n = len(images)
-            trans = 0.8
-            seg = max(1.0, (duration / n)) + trans
+            n = len(in_files)
 
-            # build ffmpeg inputs
+            # Compute per-image durations (allow variable timing via payload.durations)
+            given_durations = payload.get('durations') or payload.get('timings') or []
+            if given_durations and len(given_durations) >= n:
+                segs = [max(0.5, float(x)) for x in given_durations[:n]]
+            else:
+                # Distribute duration unevenly for rhythm if requested
+                if payload.get('variable_timing'):
+                    # simple pattern: favor middle frames
+                    segs = []
+                    base = max(1.0, duration / n)
+                    for i in range(n):
+                        factor = 1.0 + (0.3 * (0.5 - abs((i - (n-1)/2)/((n-1)/2 if n>1 else 1))))
+                        segs.append(max(0.6, base * factor))
+                else:
+                    segs = [max(1.0, duration / n) for _ in range(n)]
+
+            # helper to create a short video for each image with optional ken burns
+            segment_files = []
+            out_w, out_h = None, None
+            # derive output resolution from aspect and base width 720 for vertical social formats
+            if aspect:
+                w,h = (720, 1280) if aspect in ('9:16','9:16','vertical') else ((720,720) if aspect in ('1:1','square') else (1280,720))
+                out_w, out_h = w,h
+            else:
+                out_w, out_h = 1280, 720
+
+            for i, infile in enumerate(in_files):
+                seg = float(segs[i])
+                eff = effects[i] if i < len(effects) else {}
+                # Ken Burns parameters
+                if eff and eff.get('type') == 'ken_burns':
+                    start_scale = float(eff.get('start_scale', 1.0))
+                    end_scale = float(eff.get('zoom', eff.get('end_scale', 1.08)))
+                    pan_x = float(eff.get('pan_x', eff.get('movement_x', 0.0)))
+                    pan_y = float(eff.get('pan_y', eff.get('movement_y', 0.0)))
+                else:
+                    # default subtle ken burns
+                    start_scale = 1.02
+                    end_scale = 1.12
+                    pan_x = 0.0
+                    pan_y = 0.0
+
+                frames = int(max(1, seg * fps))
+                # zoompan expression: linear interpolation per frame
+                # z = start + (end-start)*(on/(n-1))
+                if frames>1:
+                    z_expr = f"{start_scale} + ({end_scale - start_scale})*(on/{max(frames-1,1)})"
+                else:
+                    z_expr = f"{start_scale}"
+
+                # compute pan expression in pixels: pan range based on movement fractions
+                # x = (iw - iw/zoom)/2 + pan_x*(iw/zoom)
+                x_expr = f"(iw - iw/({z_expr}))/2 + ({pan_x})*(iw/({z_expr}))"
+                y_expr = f"(ih - ih/({z_expr}))/2 + ({pan_y})*(ih/({z_expr}))"
+
+                seg_out = Path(workdir) / f'seg{i:03d}.mp4'
+                vf = f"scale={out_w}:{out_h},zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={out_w}x{out_h},fps={fps},format=yuv420p"
+                cmd = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-loop', '1', '-t', str(seg), '-i', infile,
+                    '-vf', vf,
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', str(seg_out)
+                ]
+                try:
+                    subprocess.check_call(cmd)
+                except subprocess.CalledProcessError as e:
+                    # fallback: simple looped image to video
+                    cmd2 = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-loop', '1', '-t', str(seg), '-i', infile, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(seg_out)]
+                    subprocess.check_call(cmd2)
+                segment_files.append(str(seg_out))
+
+            # Now build the filter_complex to chain segments with transitions
+            # We'll use xfade for available transition types and fallback to fade
+            # Prepare inputs
             cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-            for i in range(n):
-                cmd += ['-loop', '1', '-t', str(seg), '-i', str(Path(workdir) / f'img{i:03d}.png')]
+            for sf in segment_files:
+                cmd += ['-i', sf]
 
-            # build filter_complex
             filters = []
-            # initial stream label
-            # chain xfade between streams
-            # prepare labels: [0:v] [1:v] ...
             last_label = '[0:v]'
-            for i in range(1, n):
-                offset = seg * i - trans
-                filt = f"{last_label}[{i}:v]xfade=transition=fade:duration={trans}:offset={offset}[v{i}]"
+            current_label = '0'
+            # transition duration (choose small for social rhythm)
+            for i in range(1, len(segment_files)):
+                t_type = transitions[i-1] if i-1 < len(transitions) else 'fade'
+                # map user-friendly names to xfade transitions (fallback to fade)
+                mapping = {
+                    'fade': 'fade', 'fade_black': 'fade', 'slide_left': 'slideleft', 'slide_right': 'slideright',
+                    'wipe_up': 'wipeup', 'wipe_down': 'wipedown', 'zoom_rotate': 'slideleft'
+                }
+                xfade_name = mapping.get(t_type, 'fade')
+                trans_dur = min(0.8, float(payload.get('transition_duration', 0.6)))
+                offset = 0
+                # compute offset as cumulative durations so far minus trans_dur
+                offset = sum([float(segs[j]) for j in range(i)]) - trans_dur
+                filt = f"{last_label}[{i}:v]xfade=transition={xfade_name}:duration={trans_dur}:offset={offset}[v{i}]"
                 filters.append(filt)
                 last_label = f"[v{i}]"
 
             filter_complex = ';'.join(filters)
+            out_path = Path(workdir) / 'out.mp4'
             if not filter_complex:
-                # Single image: just create a short looped video
-                in_file = str(Path(workdir) / 'img000.png')
-                out_path = Path(workdir) / 'out.mp4'
-                cmd_simple = [
-                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                    '-loop', '1', '-i', in_file,
-                    '-c:v', 'libx264', '-t', str(duration), '-pix_fmt', 'yuv420p', str(out_path)
-                ]
-                subprocess.check_call(cmd_simple)
+                # single segment -> move to out
+                shutil.copyfile(segment_files[0], out_path)
             else:
-                out_path = Path(workdir) / 'out.mp4'
                 full_cmd = cmd + ['-filter_complex', filter_complex, '-map', last_label, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out_path)]
                 subprocess.check_call(full_cmd)
 
-            with open(out_path, 'rb') as f:
+            # post processing: motion blur, film grain, color grade, sharpening
+            post_in = str(out_path)
+            post_tmp = Path(workdir) / 'out_post.mp4'
+            post_filters = []
+            if motion_blur:
+                # simple temporal blend to emulate motion blur
+                post_filters.append('tblend=all_mode=average')
+            if film_grain and film_grain > 0.0:
+                # noise: amount based on film_grain (0-0.5)
+                mag = max(0.01, min(0.5, film_grain))
+                # alls param controls strength; use integer like 12*mag
+                alls = int(20 * mag)
+                post_filters.append(f'noise=alls={alls}:allf=t')
+            if color_grade == 'cinematic':
+                # mild lift/gamma/sat adjustment
+                post_filters.append('eq=contrast=1.08:brightness=0.01:saturation=1.06')
+            if sharpening and sharpening > 0.0:
+                post_filters.append(f'unsharp=5:5:{sharpening}')
+
+            if post_filters:
+                vf = ','.join(post_filters)
+                cmd_post = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', post_in, '-vf', vf, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(post_tmp)]
+                subprocess.check_call(cmd_post)
+                final_path = post_tmp
+            else:
+                final_path = out_path
+
+            with open(final_path, 'rb') as f:
                 vbytes = f.read()
             v64 = base64.b64encode(vbytes).decode()
             return jsonify({'status': 'success', 'video': f'data:video/mp4;base64,{v64}'})

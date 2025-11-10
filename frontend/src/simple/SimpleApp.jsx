@@ -17,6 +17,8 @@ export default function SimpleApp() {
   const [images, setImages] = useState([])
   const [selected, setSelected] = useState([])
   const [videoUrl, setVideoUrl] = useState(null)
+  const [modelsUsed, setModelsUsed] = useState([])
+  const [hfDiagnostics, setHfDiagnostics] = useState(null)
   const [loading, setLoading] = useState(false)
 
   async function generate() {
@@ -31,6 +33,8 @@ export default function SimpleApp() {
         setImages(j.images)
         setSelected([])
         setVideoUrl(null)
+        setModelsUsed(Array.isArray(j.models_used) ? j.models_used : [])
+        setHfDiagnostics(j.hf_diagnostics || null)
       } else {
         alert('Generation failed: ' + (j.message || JSON.stringify(j)))
       }
@@ -49,9 +53,34 @@ export default function SimpleApp() {
     setLoading(true)
     try {
       const chosen = selected.map(i => images[i])
+      // Build a social-media-optimized payload (TikTok vertical by default)
+      const defaultEffects = chosen.map((_, idx) => ({
+        type: 'ken_burns',
+        zoom: idx % 2 === 0 ? 1.3 : 1.2,
+        pan_x: idx % 2 === 0 ? 0.1 : -0.1,
+        pan_y: 0
+      }))
+      const defaultTransitions = []
+      for (let i = 0; i < Math.max(0, chosen.length - 1); i++) defaultTransitions.push(i % 2 === 0 ? 'slide_left' : 'fade')
+
+      const payload = {
+        images: chosen,
+        preset: 'tiktok',
+        aspect_ratio: '9:16',
+        fps: 30,
+        duration: Math.max(3, chosen.length * 2),
+        effects: defaultEffects,
+        transitions: defaultTransitions,
+        motion_blur: true,
+        film_grain: 0.04,
+        color_grade: 'cinematic',
+        sharpening: 0.6,
+        variable_timing: true
+      }
+
       const res = await fetch('/api/render-dynamic-video', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({images: chosen, fps: 12, duration: 6})
+        body: JSON.stringify(payload)
       })
       const j = await res.json()
       if (j.status === 'success' && j.video) {
@@ -79,6 +108,9 @@ export default function SimpleApp() {
           {images.map((src, i) => (
             <div key={i} style={{border: selected.includes(i) ? '3px solid #0af' : '1px solid #ddd', padding:6}}>
               <img src={src} alt={`v${i}`} style={{width:'100%',height:160,objectFit:'cover'}} />
+                  {modelsUsed && modelsUsed[i] && (
+                    <div style={{fontSize:11, color:'#444', marginTop:6}}>Model: {modelsUsed[i]}</div>
+                  )}
               <div style={{display:'flex',justifyContent:'space-between',marginTop:6}}>
                 <label><input type='checkbox' checked={selected.includes(i)} onChange={()=>toggleSelect(i)} /> Select</label>
                 <a download={`image_${i}.png`} href={src}>Download</a>
@@ -98,6 +130,17 @@ export default function SimpleApp() {
           </div>
         )}
       </div>
+
+      {hfDiagnostics && (
+        <div style={{marginTop:12, padding:8, background:'#fff3f0', border:'1px solid #ffd0c2'}}>
+          <strong>Hugging Face diagnostics:</strong>
+          <pre style={{whiteSpace:'pre-wrap', fontSize:12, marginTop:6}}>{hfDiagnostics}</pre>
+        </div>
+      )}
+
+      {modelsUsed && modelsUsed.length>0 && (
+        <div style={{marginTop:12, fontSize:13, color:'#333'}}>First model used: <strong>{modelsUsed[0]}</strong></div>
+      )}
 
       {loading && <div style={{marginTop:12}}>Working…</div>}
     </div>

@@ -1,3 +1,4 @@
+nohup: ignoring input
 🚀 Using device: cpu
 ℹ️ GPU not available — skipping heavy model load. Using fallback mode.
 🚀 Starting RealityBlur AI Server...
@@ -5,22 +6,14 @@
  * Debug mode: on
 [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
  * Running on all addresses (0.0.0.0)
- * Running on http://127.0.0.1:5002
- * Running on http://10.0.11.16:5002
+ * Running on http://127.0.0.1:5000
+ * Running on http://10.0.0.42:5000
 [33mPress CTRL+C to quit[0m
  * Restarting with stat
  * Debugger is active!
- * Debugger PIN: 507-625-942
-/home/vscode/.local/lib/python3.11/site-packages/huggingface_hub/utils/_deprecation.py:131: FutureWarning: 'InferenceApi' (from 'huggingface_hub.inference_api') is deprecated and will be removed from version '1.0'. `InferenceApi` client is deprecated in favor of the more feature-complete `InferenceClient`. Check out this guide to learn how to convert your script to use it: https://huggingface.co/docs/huggingface_hub/guides/inference#legacy-inferenceapi-client.
-  warnings.warn(warning_message, FutureWarning)
-127.0.0.1 - - [09/Nov/2025 21:14:58] "POST /api/generate HTTP/1.1" 200 -
-127.0.0.1 - - [09/Nov/2025 21:15:07] "GET / HTTP/1.1" 200 -
- * Detected change in '/workspaces/RealityBlur/backend/app.py', reloading
-🚀 Using device: cpu
-ℹ️ GPU not available — skipping heavy model load. Using fallback mode.
-🚀 Starting RealityBlur AI Server...
-🎬 Generating for prompt: a beautiful sunset over mountains
-❌ Hugging Face API error: Hugging Face generation failed; attempts: [["InferenceClient", ""], ["InferenceApi", "status=410, content-type=application/json; charset=utf-8, text={\"error\":\"https://api-inference.huggingface.co is no longer supported. Please use https://router.huggingface.co/hf-inference instead.\"}"], ["router", "status=404, text=Not Found"], ["legacy_api", "status=410, text={\"error\":\"https://api-inference.huggingface.co is no longer supported. Please use https://router.huggingface.co/hf-inference instead.\"}"]]
- * Restarting with stat
- * Debugger is active!
- * Debugger PIN: 507-625-942
+ * Debugger PIN: 984-069-106
+127.0.0.1 - - [10/Nov/2025 18:53:41] "POST /api/generate-variations HTTP/1.1" 200 -
+127.0.0.1 - - [10/Nov/2025 18:53:41] "POST /api/generate-variations HTTP/1.1" 200 -
+127.0.0.1 - - [10/Nov/2025 19:04:57] "POST /api/generate-variations HTTP/1.1" 200 -
+127.0.0.1 - - [10/Nov/2025 19:37:47] "POST /api/render-dynamic-video HTTP/1.1" 200 -
+127.0.0.1 - - [10/Nov/2025 19:51:41] "POST /api/render-dynamic-video HTTP/1.1" 200 -
